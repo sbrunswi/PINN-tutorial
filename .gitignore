@@ -1,6 +1,7 @@
 # person files
 toy/
 myenv/
+data/plots*
 # C extensions
 *.so
 
