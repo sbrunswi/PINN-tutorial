@@ -1,35 +1,33 @@
 """
-sampling_script.py
+generate_msd_data.py
 ====================
 Generates Mass-Spring-Damper data and saves to a .pkl file.
-All core functionality is identical to the original sampling script.
 
 Usage examples
 --------------
-# defaults (replicates original script exactly)
-python sampling_script.py
+# defaults
+python generate_msd_data.py
 
 # custom physical parameters
-python sampling_script.py --m 2.0 --c 0.3 --k 0.2
+python generate_msd_data.py --m 2.0 --c 0.3 --k 0.2
 
-# custom sparsity levels
-python sampling_script.py --sparsity 50 100 200
+# custom sampling and sparsity in Hz
+python generate_msd_data.py --sampling_rate 10.0 --sparsity_hz 0.83 1.67 2.5
 
 # custom noise
-python sampling_script.py --noise_sd 0.05
+python generate_msd_data.py --noise_sd 0.05
 
 # specific forcing models only
-python sampling_script.py --forcing none sinusoidal
+python generate_msd_data.py --forcing none sinusoidal
 
-# save plots (directory auto-named from parameters)
-python sampling_script.py --plots
+# longer simulation
+python generate_msd_data.py --t_end 120.0 --sampling_rate 10.0 --sparsity_hz 1.0 2.0
+
+# save plots
+python generate_msd_data.py --plots
 
 # custom output path
-python sampling_script.py --output /path/to/my_data.pkl
-
-# full custom example
-python sampling_script.py --m 1.5 --c 0.2 --k 0.3 --sparsity 50 100 --noise_sd 0.05 --forcing none sinusoidal --plots --output custom_data.pkl
-# → saves plots to: plots_m1.5_c0.2_k0.3_sd0.05_s50-100_fnone-sinusoidal_seed42/
+python generate_msd_data.py --output /path/to/my_data.pkl
 """
 
 import argparse
@@ -67,14 +65,16 @@ def parse_args():
                         help='Initial conditions [position velocity] (default: 1.0 0.0)')
 
     # Time span
-    parser.add_argument('--t_end',   type=float, default=60.0,
+    parser.add_argument('--t_end',         type=float, default=60.0,
                         help='End time [s] (default: 60.0)')
-    parser.add_argument('--fs',  type=int,   default=100,
-                        help='Sampling rate [Hz] (default: 100)')
+    parser.add_argument('--sampling_rate', type=float, default=10.0,
+                        help='Ground truth sampling rate [Hz] (default: 10.0)')
 
-    # Sparsity
-    parser.add_argument('--sparsity', type=int, nargs='+', default=[50, 100, 150],
-                        help='Sparsity levels (default: 50 100 150)')
+    # Sparsity in Hz — must be <= sampling_rate
+    parser.add_argument('--sparsity_hz', type=float, nargs='+',
+                        default=[0.833, 1.667, 2.5],
+                        help='Observation sampling rates [Hz] (default: 0.833 1.667 2.5 '
+                             '≈ 50 100 150 points over 60s). Must be <= sampling_rate.')
 
     # Noise
     parser.add_argument('--noise_sd',   type=float, default=0.1,
@@ -94,8 +94,7 @@ def parse_args():
     parser.add_argument('--output', type=str, default='massdamper_data.pkl',
                         help='Output .pkl file path (default: massdamper_data.pkl)')
     parser.add_argument('--plots', action='store_true',
-                        help='Generate and save plots (off by default). '
-                             'Directory is auto-named from call parameters.')
+                        help='Generate and save plots (off by default).')
 
     return parser.parse_args()
 
@@ -138,8 +137,19 @@ def main():
     Kp     = args.Kp
     x0     = args.x0
     t_span = (0, args.t_end)
-    n_eval  = int(args.t_end * args.fs)+1 #adding + 1 to include the endpoint
-    t_eval = np.linspace(*t_span, args.n_eval)
+
+    # ground truth grid
+    n_eval = int(args.t_end * args.sampling_rate)
+    t_eval = np.linspace(*t_span, n_eval)
+
+    # convert sparsity_hz to number of points — guaranteed <= n_eval
+    for fs in args.sparsity_hz:
+        if fs > args.sampling_rate:
+            raise ValueError(
+                f"sparsity_hz={fs} Hz exceeds sampling_rate={args.sampling_rate} Hz. "
+                f"Observation rate cannot exceed ground truth rate."
+            )
+    sparsity_counts = [int(args.t_end * fs) for fs in args.sparsity_hz]
 
     # derived parameters
     delta_val  = c_true / (2 * m_true)
@@ -148,25 +158,26 @@ def main():
 
     print(f"Physical parameters: m={m_true}, c={c_true}, k={k_true}")
     print(f"Derived: delta={delta_val:.4f}, omega0={omega0_val:.4f}")
+    print(f"Ground truth: {args.sampling_rate} Hz → {n_eval} points over {args.t_end}s")
+    print(f"Sparsity levels: {args.sparsity_hz} Hz → {sparsity_counts} points")
     print(f"Forcing models: {args.forcing}")
-    print(f"Sparsity levels: {args.sparsity}")
     print(f"Noise: mean={args.noise_mean}, sd={args.noise_sd}")
 
     # ---------------------------
-    # Define forcing terms
+    # Forcing terms
     # ---------------------------
     forcing_map = {
-        'none':      (0,                                              None,  'No external force'),
-        'sinusoidal':(lambda t: np.sin(2 * np.pi * t),               None,  'sinusoidal force'),
-        'square':    (lambda t: scipy.signal.square(2*np.pi*0.5*t),  None,  'square wave force'),
-        'reference': (lambda t, x: Kp * (reference_signal(t) - x),  Kp,    'reference tracking with P controller'),
+        'none':       (0,                                              None, 'No external force'),
+        'sinusoidal': (lambda t: np.sin(2 * np.pi * t),               None, 'sinusoidal force'),
+        'square':     (lambda t: scipy.signal.square(2*np.pi*0.5*t),  None, 'square wave force'),
+        'reference':  (lambda t, x: Kp * (reference_signal(t) - x),  Kp,   'reference tracking with P controller'),
     }
 
-    w_1 = 0
-    selected         = [forcing_map[f] for f in args.forcing]
-    u_funcs          = [s[0] for s in selected]
-    Kp_array         = [s[1] for s in selected]
-    u_legend         = [s[2] for s in selected]
+    w_1      = 0
+    selected = [forcing_map[f] for f in args.forcing]
+    u_funcs  = [s[0] for s in selected]
+    Kp_array = [s[1] for s in selected]
+    u_legend = [s[2] for s in selected]
 
     # ---------------------------
     # Ground truth simulation
@@ -177,7 +188,7 @@ def main():
                         args=(m_true, c_true, k_true, u_funcs[i], w_1, Kp_array[i]))
         sol_inharm.append(sol)
 
-    print(f"Simulated {len(sol_inharm)} forcing models over t={t_span}, {args.n_eval} timepoints.")
+    print(f"Simulated {len(sol_inharm)} forcing models.")
 
     # ---------------------------
     # Ground truth dictionary
@@ -187,7 +198,8 @@ def main():
             'x0': x0, 't_span': t_span, 't_eval': t_eval,
             'm_true': m_true, 'c_true': c_true, 'k_true': k_true,
             'Kp_array': Kp_array, 'delta_val': delta_val,
-            'omega0_val': omega0_val, 'T_val': T_val
+            'omega0_val': omega0_val, 'T_val': T_val,
+            'sampling_rate': args.sampling_rate,
         }
     }
     for i in range(len(u_funcs)):
@@ -199,16 +211,15 @@ def main():
 
     # ---------------------------
     # Evenly spaced samples (no noise)
+    # dictionary keys use Hz e.g. 'sparsity 0.833Hz'
     # ---------------------------
     data_sampled = {}
     for n_idx in range(len(u_funcs)):
         model_name = u_legend[n_idx]
         data_sampled[model_name] = {}
-        t_samples = [np.linspace(0, len(sol_inharm[n_idx].t) - 1, m).astype(int)
-                     for m in args.sparsity]
-        for m_idx, m in enumerate(args.sparsity):
-            subsamples = t_samples[m_idx]
-            data_sampled[model_name][f'sparcity level {m}'] = {
+        for fs, m in zip(args.sparsity_hz, sparsity_counts):
+            subsamples = np.linspace(0, len(sol_inharm[n_idx].t) - 1, m).astype(int)
+            data_sampled[model_name][f'sparsity {fs}Hz'] = {
                 't': sol_inharm[n_idx].t[subsamples],
                 'x': sol_inharm[n_idx].y[0][subsamples],
                 'v': sol_inharm[n_idx].y[1][subsamples],
@@ -224,10 +235,10 @@ def main():
         t_full = sol_inharm[n_idx].t
         x_full = sol_inharm[n_idx].y[0]
         v_full = sol_inharm[n_idx].y[1]
-        for m in args.sparsity:
+        for fs, m in zip(args.sparsity_hz, sparsity_counts):
             indices = np.random.choice(len(t_full), size=m, replace=False)
             indices = np.sort(indices)
-            data_sampled_random[model_name][str(m)] = {
+            data_sampled_random[model_name][f'sparsity {fs}Hz'] = {
                 't': t_full[indices],
                 'x': x_full[indices],
                 'v': v_full[indices],
@@ -240,13 +251,14 @@ def main():
     for n_idx in range(len(u_funcs)):
         model_name = u_legend[n_idx]
         data_sampled_random_with_noise[model_name] = {}
-        for m in args.sparsity:
-            x_clean = data_sampled[model_name][f'sparcity level {m}']['x']
-            v_clean = data_sampled[model_name][f'sparcity level {m}']['v']
+        for fs, m in zip(args.sparsity_hz, sparsity_counts):
+            key     = f'sparsity {fs}Hz'
+            x_clean = data_sampled[model_name][key]['x']
+            v_clean = data_sampled[model_name][key]['v']
             x_noise = x_clean + np.random.normal(args.noise_mean, args.noise_sd, size=x_clean.shape)
             v_noise = x_clean + np.random.normal(args.noise_mean, args.noise_sd, size=v_clean.shape)
-            data_sampled_random_with_noise[model_name][f'sparcity level {m}'] = {
-                't': data_sampled[model_name][f'sparcity level {m}']['t'],
+            data_sampled_random_with_noise[model_name][key] = {
+                't': data_sampled[model_name][key]['t'],
                 'x': x_noise,
                 'v': v_noise,
             }
@@ -255,21 +267,21 @@ def main():
     # Collocation points
     # ---------------------------
     data_colloc = {
-        f"Collocation points {n}": np.linspace(0, t_span[1], n)
-        for n in args.sparsity
+        f"Collocation points {fs}Hz": np.linspace(0, t_span[1], m)
+        for fs, m in zip(args.sparsity_hz, sparsity_counts)
     }
 
     # ---------------------------
     # Plots
     # ---------------------------
     if args.plots:
-        # auto-name directory from call parameters
-        sparsity_str  = '-'.join(str(s) for s in args.sparsity)
-        forcing_str   = '-'.join(args.forcing)
-        plot_dir      = (
+        sparsity_str = '-'.join(str(s) for s in args.sparsity_hz)
+        forcing_str  = '-'.join(args.forcing)
+        plot_dir     = (
             f"plots_m{m_true}_c{c_true}_k{k_true}"
+            f"_fs{args.sampling_rate}"
             f"_sd{args.noise_sd}"
-            f"_s{sparsity_str}"
+            f"_s{sparsity_str}Hz"
             f"_f{forcing_str}"
             f"_seed{args.seed}"
         )
@@ -282,7 +294,7 @@ def main():
             plt.close()
             print(f"  Saved: {path}")
 
-        # 1. Ground truth trajectories — all forcing models
+        # Ground truth
         fig, ax = plt.subplots(figsize=(10, 4))
         for i in range(len(u_funcs)):
             ax.plot(sol_inharm[i].t, sol_inharm[i].y[0], label=f"x(t) – {u_legend[i]}")
@@ -291,66 +303,31 @@ def main():
             ax.plot(sol_inharm[ref_idx].t,
                     [reference_signal(t) for t in sol_inharm[ref_idx].t],
                     '--', label='reference r(t)')
-        ax.set_xlabel("time t [s]")
-        ax.set_ylabel("Displacement x(t) [m]")
+        ax.set_xlabel("time t [s]"); ax.set_ylabel("Displacement x(t) [m]")
         ax.set_title("Ground truth — all forcing models")
         ax.legend(); ax.grid(True); fig.tight_layout()
         savefig("ground_truth.png")
 
-        # 2. Evenly spaced samples — one plot per sparsity level
-        for s in args.sparsity:
+        for fs, m in zip(args.sparsity_hz, sparsity_counts):
+            key = f'sparsity {fs}Hz'
+
             fig, ax = plt.subplots(figsize=(10, 4))
             for model_name in u_legend:
-                d = data_sampled[model_name][f'sparcity level {s}']
+                d = data_sampled[model_name][key]
                 ax.scatter(d['t'], d['x'], label=model_name, s=4, lw=0)
-            ax.set_title(f"Evenly spaced samples — sparsity {s}")
+            ax.set_title(f"Evenly spaced — {fs} Hz ({m} points)")
             ax.set_xlabel("t"); ax.set_ylabel("x(t)")
             ax.legend(); ax.grid(True); fig.tight_layout()
-            savefig(f"sampled_even_s{s}.png")
+            savefig(f"sampled_even_{fs}Hz.png")
 
-        # 3. Random samples — one plot per sparsity level
-        for s in args.sparsity:
             fig, ax = plt.subplots(figsize=(10, 4))
             for model_name in u_legend:
-                d = data_sampled_random[model_name][str(s)]
-                ax.scatter(d['t'], d['x'], label=model_name, s=4)
-            ax.set_title(f"Random samples — {s} points")
-            ax.set_xlabel("t"); ax.set_ylabel("x(t)")
-            ax.legend(); ax.grid(True); fig.tight_layout()
-            savefig(f"sampled_random_s{s}.png")
-
-        # 4. Noisy samples — one plot per sparsity level
-        for s in args.sparsity:
-            fig, ax = plt.subplots(figsize=(10, 4))
-            for model_name in u_legend:
-                d = data_sampled_random_with_noise[model_name][f'sparcity level {s}']
+                d = data_sampled_random_with_noise[model_name][key]
                 ax.scatter(d['t'], d['x'], label=model_name, s=4, lw=0)
-            ax.set_title(
-                f"Noisy samples (mean={args.noise_mean}, sd={args.noise_sd}) — sparsity {s}"
-            )
+            ax.set_title(f"Noisy samples — {fs} Hz ({m} points), sd={args.noise_sd}")
             ax.set_xlabel("t"); ax.set_ylabel("x(t)")
             ax.legend(); ax.grid(True); fig.tight_layout()
-            savefig(f"sampled_noisy_s{s}.png")
-
-        # 5. Per-model overlay: clean vs noisy for each sparsity level
-        for model_name in u_legend:
-            fig, axes = plt.subplots(1, len(args.sparsity),
-                                     figsize=(5 * len(args.sparsity), 4), sharey=True)
-            if len(args.sparsity) == 1:
-                axes = [axes]
-            for ax, s in zip(axes, args.sparsity):
-                clean = data_sampled[model_name][f'sparcity level {s}']
-                noisy = data_sampled_random_with_noise[model_name][f'sparcity level {s}']
-                ax.plot(clean['t'], clean['x'], lw=1.5, label='clean')
-                ax.scatter(noisy['t'], noisy['x'], s=6, color='tomato', label='noisy', zorder=3)
-                ax.set_title(f"sparsity {s}")
-                ax.set_xlabel("t"); ax.grid(True)
-                ax.legend(fontsize=8)
-            axes[0].set_ylabel("x(t)")
-            safe_name = model_name.replace(' ', '_').replace('/', '_')
-            fig.suptitle(f"{model_name} — clean vs noisy")
-            fig.tight_layout()
-            savefig(f"clean_vs_noisy_{safe_name}.png")
+            savefig(f"sampled_noisy_{fs}Hz.png")
 
         print(f"All plots saved to {plot_dir}/")
 
@@ -364,7 +341,7 @@ def main():
             'data_sampled_random':            data_sampled_random,
             'data_sampled_random_with_noise': data_sampled_random_with_noise,
             'data_colloc':                    data_colloc,
-            'args':                           vars(args),   # store run config
+            'args':                           vars(args),
         }, f)
 
     print(f"Saved to {args.output}")
